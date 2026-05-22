@@ -255,7 +255,6 @@ io.on('connection', (socket) => {
     if (card.value === 'swap' && !targetId) {
       return socket.emit('error', { message: 'Choose a player to swap with' });
     }
-    
     player.hand.splice(cardIdx, 1);
     room.discardPile.push(card);
     room.currentColor = card.type === 'wild' ? chosenColor : card.color;
@@ -276,13 +275,8 @@ io.on('connection', (socket) => {
       }
     }
     
-    // UNO penalty: if player went down to 1 card but didn't call UNO before playing
-    if (player.hand.length === 1 && !player.calledUno) {
-      drawCards(room, playerIdx, 2);
-      room.message = `${player.name} forgot to call UNO! Draws 2 cards. 😅`;
-      broadcast(room);
-    } else if (player.hand.length !== 1) {
-      // Reset UNO call when no longer at 1 card
+    // Reset UNO call when no longer at 1 card
+    if (player.hand.length !== 1) {
       player.calledUno = false;
     }
     
@@ -321,6 +315,23 @@ io.on('connection', (socket) => {
     }
     
     broadcast(room);
+    
+    // UNO penalty timer: if a player has 1 card and didn't call UNO, give them 3 seconds
+    const playersAtOne = room.players.filter(p => p.hand.length === 1 && !p.calledUno);
+    playersAtOne.forEach(p => {
+      const pid = p.id;
+      setTimeout(() => {
+        const currentRoom = rooms[code];
+        if (!currentRoom || currentRoom.state !== 'playing') return;
+        const stillThere = currentRoom.players.find(pp => pp.id === pid);
+        if (stillThere && stillThere.hand.length === 1 && !stillThere.calledUno) {
+          const idx = currentRoom.players.indexOf(stillThere);
+          drawCards(currentRoom, idx, 2);
+          currentRoom.message = `${stillThere.name} forgot to call UNO! Draws 2 cards. 😅`;
+          broadcast(currentRoom);
+        }
+      }, 3000);
+    });
   });
 
   socket.on('drawCard', ({ code }) => {
@@ -340,8 +351,8 @@ io.on('connection', (socket) => {
     if (!room || room.state !== 'playing') return;
     const player = room.players.find(p => p.id === socket.id);
     if (!player) return;
-    // Can call UNO when about to have 1 card (currently have 2) or already at 1 card
-    if (player.hand.length === 2 || player.hand.length === 1) {
+    // Can only call UNO when have exactly 1 card left
+    if (player.hand.length === 1 && !player.calledUno) {
       player.calledUno = true;
       room.message = `${player.name} called UNO! 🎯`;
       broadcast(room);

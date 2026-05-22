@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
@@ -33,6 +34,8 @@ function createDeck() {
     deck.push({ id: id++, color: 'wild', value: 'wild', type: 'wild' });
     deck.push({ id: id++, color: 'wild', value: '+4', type: 'wild' });
   }
+  // Special: Swap Hands card (1 card per deck)
+  deck.push({ id: id++, color: 'wild', value: 'swap', type: 'wild' });
   return deck;
 }
 
@@ -52,6 +55,44 @@ function canPlay(card, top, currentColor) {
   return false;
 }
 
+// ========== Stats Storage ==========
+const STATS_FILE = path.join(__dirname, 'stats.json');
+let stats = {};
+try {
+  if (fs.existsSync(STATS_FILE)) {
+    stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf-8'));
+  }
+} catch (e) { stats = {}; }
+
+function saveStats() {
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats));
+  } catch (e) { console.error('Save stats failed:', e); }
+}
+
+function recordWin(name) {
+  if (!name) return;
+  if (!stats[name]) stats[name] = { wins: 0, games: 0 };
+  stats[name].wins++;
+  saveStats();
+}
+
+function recordGame(names) {
+  names.forEach(name => {
+    if (!name) return;
+    if (!stats[name]) stats[name] = { wins: 0, games: 0 };
+    stats[name].games++;
+  });
+  saveStats();
+}
+
+function getLeaderboard() {
+  return Object.entries(stats)
+    .map(([name, s]) => ({ name, wins: s.wins, games: s.games }))
+    .sort((a, b) => b.wins - a.wins)
+    .slice(0, 10);
+}
+
 // ========== Room Management ==========
 const rooms = {};
 
@@ -65,7 +106,7 @@ function createRoom(hostId, hostName) {
   rooms[code] = {
     code,
     hostId,
-    players: [{ id: hostId, name: hostName, hand: [], connected: true }],
+    players: [{ id: hostId, name: hostName, hand: [], connected: true, calledUno: false }],
     state: 'waiting',
     drawPile: [],
     discardPile: [],
@@ -73,7 +114,8 @@ function createRoom(hostId, hostName) {
     direction: 1,
     currentColor: null,
     winner: null,
-    message: ''
+    message: '',
+    chat: []
   };
   return rooms[code];
 }
@@ -88,7 +130,8 @@ function getPublicState(room, forPlayerId) {
       name: p.name,
       handCount: p.hand.length,
       hand: p.id === forPlayerId ? p.hand : undefined,
-      connected: p.connected
+      connected: p.connected,
+      calledUno: p.calledUno
     })),
     topCard: room.discardPile[room.discardPile.length - 1] || null,
     drawPileCount: room.drawPile.length,
@@ -96,7 +139,8 @@ function getPublicState(room, forPlayerId) {
     direction: room.direction,
     currentColor: room.currentColor,
     winner: room.winner,
-    message: room.message
+    message: room.message,
+    chat: room.chat.slice(-30)
   };
 }
 
@@ -108,7 +152,7 @@ function broadcast(room) {
 
 function startGame(room) {
   let deck = shuffle(createDeck());
-  room.players.forEach(p => { p.hand = deck.splice(0, 7); });
+  room.players.forEach(p => { p.hand = deck.splice(0, 7); p.calledUno = false; });
   let firstCard = deck.shift();
   while (firstCard.type !== 'number') {
     deck.push(firstCard);
@@ -123,6 +167,7 @@ function startGame(room) {
   room.winner = null;
   room.state = 'playing';
   room.message = `Game started! ${room.players[0].name}'s turn.`;
+  recordGame(room.players.map(p => p.name));
 }
 
 function drawCards(room, playerIdx, count) {
@@ -151,6 +196,12 @@ function advanceTurn(room, skip = 1) {
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
 
+  socket.emit('leaderboard', getLeaderboard());
+
+  socket.on('getLeaderboard', () => {
+    socket.emit('leaderboard', getLeaderboard());
+  });
+
   socket.on('createRoom', ({ name }) => {
     const room = createRoom(socket.id, name || 'Player');
     socket.join(room.code);
@@ -164,7 +215,7 @@ io.on('connection', (socket) => {
     if (room.state !== 'waiting') return socket.emit('error', { message: 'Game already started' });
     if (room.players.length >= 10) return socket.emit('error', { message: 'Room is full' });
     
-    room.players.push({ id: socket.id, name: name || 'Player', hand: [], connected: true });
+    room.players.push({ id: socket.id, name: name || 'Player', hand: [], connected: true, calledUno: false });
     socket.join(room.code);
     socket.emit('roomJoined', { code: room.code });
     broadcast(room);
@@ -178,7 +229,7 @@ io.on('connection', (socket) => {
     broadcast(room);
   });
 
-  socket.on('playCard', ({ code, cardId, chosenColor }) => {
+  socket.on('playCard', ({ code, cardId, chosenColor, targetId }) => {
     const room = rooms[code];
     if (!room || room.state !== 'playing') return;
     
@@ -200,9 +251,40 @@ io.on('connection', (socket) => {
       return socket.emit('error', { message: 'Choose a color' });
     }
     
+    // Swap card requires a target
+    if (card.value === 'swap' && !targetId) {
+      return socket.emit('error', { message: 'Choose a player to swap with' });
+    }
+    
     player.hand.splice(cardIdx, 1);
     room.discardPile.push(card);
     room.currentColor = card.type === 'wild' ? chosenColor : card.color;
+    
+    // Handle swap effect
+    let swapMessage = '';
+    if (card.value === 'swap') {
+      const targetIdx = room.players.findIndex(p => p.id === targetId);
+      if (targetIdx !== -1 && targetIdx !== playerIdx) {
+        const target = room.players[targetIdx];
+        const tempHand = player.hand;
+        player.hand = target.hand;
+        target.hand = tempHand;
+        // Reset UNO flags after swap (hand sizes changed)
+        player.calledUno = false;
+        target.calledUno = false;
+        swapMessage = ` and swapped hands with ${target.name}!`;
+      }
+    }
+    
+    // UNO penalty: if player went down to 1 card but didn't call UNO before playing
+    if (player.hand.length === 1 && !player.calledUno) {
+      drawCards(room, playerIdx, 2);
+      room.message = `${player.name} forgot to call UNO! Draws 2 cards. 😅`;
+      broadcast(room);
+    } else if (player.hand.length !== 1) {
+      // Reset UNO call when no longer at 1 card
+      player.calledUno = false;
+    }
     
     let skip = 1;
     let penalty = 0;
@@ -222,11 +304,12 @@ io.on('connection', (socket) => {
       room.winner = player.name;
       room.state = 'finished';
       room.message = `${player.name} wins! 🎉`;
+      recordWin(player.name);
       broadcast(room);
       return;
     }
     
-    room.message = `${player.name} played ${card.value === 'wild' ? 'wild' : card.value} ${card.type === 'wild' ? '→ ' + chosenColor : ''}`;
+    room.message = `${player.name} played ${card.value === 'wild' ? 'wild' : card.value === 'swap' ? 'SWAP' : card.value}${card.type === 'wild' && card.value !== 'swap' ? ' → ' + chosenColor : ''}${card.value === 'swap' ? ' → ' + chosenColor + swapMessage : ''}`;
     
     advanceTurn(room, 1);
     if (penalty > 0) {
@@ -249,6 +332,17 @@ io.on('connection', (socket) => {
     drawCards(room, playerIdx, 1);
     room.message = `${room.players[playerIdx].name} drew a card.`;
     advanceTurn(room, 1);
+    broadcast(room);
+  });
+
+  socket.on('sendChat', ({ code, text }) => {
+    const room = rooms[code];
+    if (!room) return;
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+    const msg = String(text || '').trim().slice(0, 200);
+    if (!msg) return;
+    room.chat.push({ from: player.name, text: msg, time: Date.now() });
     broadcast(room);
   });
 

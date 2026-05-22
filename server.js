@@ -335,6 +335,34 @@ io.on('connection', (socket) => {
     broadcast(room);
   });
 
+  socket.on('callUno', ({ code }) => {
+    const room = rooms[code];
+    if (!room || room.state !== 'playing') return;
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+    // Can call UNO when about to have 1 card (currently have 2) or already at 1 card
+    if (player.hand.length === 2 || player.hand.length === 1) {
+      player.calledUno = true;
+      room.message = `${player.name} called UNO! 🎯`;
+      broadcast(room);
+    }
+  });
+
+  socket.on('catchNoUno', ({ code, targetId }) => {
+    const room = rooms[code];
+    if (!room || room.state !== 'playing') return;
+    const target = room.players.find(p => p.id === targetId);
+    const caller = room.players.find(p => p.id === socket.id);
+    if (!target || !caller || target.id === caller.id) return;
+    // Catch only valid if target has exactly 1 card and didn't call UNO
+    if (target.hand.length === 1 && !target.calledUno) {
+      const targetIdx = room.players.indexOf(target);
+      drawCards(room, targetIdx, 2);
+      room.message = `${caller.name} caught ${target.name} not calling UNO! ${target.name} draws 2. 😆`;
+      broadcast(room);
+    }
+  });
+
   socket.on('sendChat', ({ code, text }) => {
     const room = rooms[code];
     if (!room) return;
